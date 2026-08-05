@@ -1,27 +1,29 @@
-from fastapi import FastAPI, Depends
+import hashlib
+import requests
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-import requests
-from database import engine, Base, SessionLocal
+
+# Importações do banco de dados (certifique-se de que database.py e models.py existem)
+from database import engine, SessionLocal, Base
 import models
 
-# 1. Inicialização do Banco de Dados
+# Cria as tabelas no banco de dados automaticamente
 Base.metadata.create_all(bind=engine)
 
-# 2. Inicialização do Framework FastAPI
-app = FastAPI(title="Trace AI - ISOC Backend (Cloud Version)")
+app = FastAPI(title="Trace AI Backend")
 
-# 3. Configuração de Segurança (CORS)
+# Libera o acesso para o Painel HTML e para a Extensão do Chrome
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"], 
-    allow_headers=["*"], 
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 4. Gerenciamento de Sessão do Banco de Dados
+# Dependência do banco de dados
 def get_db():
     db = SessionLocal()
     try:
@@ -29,54 +31,53 @@ def get_db():
     finally:
         db.close()
 
-# 5. Schema de Validação do Payload
-class OcorrenciaForm(BaseModel):
-    ip_origem: str
+# --- Schemas de Validação (Pydantic) ---
+class OcorrenciaCreate(BaseModel):
     texto_interceptado: str
     url_origem: str
+    ip_origem: str = "IP_DESCONHECIDO"
 
-# 6. Rota Principal de Inserção de Ocorrências
+class OcorrenciaUpdate(BaseModel):
+    status: str
+
+# --- Função de Privacidade LGPD ---
+def anonimizar_ip(ip_real: str) -> str:
+    if not ip_real or ip_real == "IP_DESCONHECIDO":
+        return "IP_DESCONHECIDO"
+    # Criptografa o IP em uma hash irreversível
+    ip_hash = hashlib.sha256(ip_real.encode('utf-8')).hexdigest()
+    # Retorna apenas os 10 primeiros caracteres com o prefixo
+    return f"HASH-{ip_hash[:10].upper()}"
+
+
+# --- ROTAS DA API ---
+
 @app.post("/api/v1/ocorrencias/")
-def registrar_ocorrencia(dados: OcorrenciaForm, db: Session = Depends(get_db)):
+def criar_ocorrencia(dados: OcorrenciaCreate, db: Session = Depends(get_db)):
     
-    # URL oficial da API de Inferência gratuita da Hugging Face
-    API_URL = "https://api-inference.huggingface.co/models/nlptown/bert-base-multilingual-uncased-sentiment"
+    # 1. Análise de Risco com a IA (Hugging Face)
+    API_URL = "https://api-inference.huggingface.co/models/unitary/toxic-bert"
+    # ATENÇÃO: Coloque o seu token real aqui se for exigido pela API
+    headers = {"Authorization": "Bearer SEU_TOKEN_HUGGING_FACE"} 
     
+    score_calculado = 0.0
     try:
-        # Envia o texto pela internet para os servidores da Hugging Face processarem
-        resposta = requests.post(API_URL, json={"inputs": dados.texto_interceptado})
-        
-        # Verifica se a Hugging Face respondeu com sucesso (Código 200)
-        if resposta.status_code == 200:
-            dados_ia = resposta.json()
-            # A API devolve uma lista de probabilidades. Pegamos a classificação vencedora.
-            label_estrelas = dados_ia[0][0]['label']
-        else:
-            # Caso a API gratuita esteja sobrecarregada no momento, evitamos que o sistema quebre
-            label_estrelas = "3 stars" 
-            
+        resposta_ia = requests.post(API_URL, headers=headers, json={"inputs": dados.texto_interceptado})
+        if resposta_ia.status_code == 200:
+            resultados = resposta_ia.json()
+            score_calculado = resultados[0][0].get("score", 0.0)
     except Exception as e:
-        print(f"Erro de comunicação com a IA: {e}")
-        label_estrelas = "3 stars"
+        print(f"Erro ao conectar com Hugging Face: {e}")
 
-    # Mapeamento Tático: Conversão da escala de sentimento para Score de Risco
-    if label_estrelas == "1 star":
-        score_risco = 0.95
-    elif label_estrelas == "2 stars":
-        score_risco = 0.75
-    elif label_estrelas == "3 stars":
-        score_risco = 0.50
-    elif label_estrelas == "4 stars":
-        score_risco = 0.15
-    else:
-        score_risco = 0.05
-    
-    # Instanciação e salvamento no Banco de Dados
+    # 2. Aplica o Hashing no IP
+    ip_seguro = anonimizar_ip(dados.ip_origem)
+
+    # 3. Salva no banco de dados com o IP protegido
     nova_ocorrencia = models.Ocorrencia(
-        ip_origem=dados.ip_origem,
         texto_interceptado=dados.texto_interceptado,
+        score_risco=score_calculado,
         url_origem=dados.url_origem,
-        score_risco=score_risco,
+        ip_origem=ip_seguro,
         status="pendente"
     )
     
@@ -84,38 +85,24 @@ def registrar_ocorrencia(dados: OcorrenciaForm, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(nova_ocorrencia)
     
-    return {
-        "mensagem": "Telemetria recebida e processada via API Nuvem",
-        "id_gerado": nova_ocorrencia.id,
-        "risco_detectado": nova_ocorrencia.score_risco,
-        "classificacao_label": label_estrelas
-    }
+    return nova_ocorrencia
 
-# 7. Rota de Consulta (Painel ISOC)
+
 @app.get("/api/v1/ocorrencias/")
 def listar_ocorrencias(db: Session = Depends(get_db)):
-    ocorrencias = db.query(models.Ocorrencia).order_by(models.Ocorrencia.data_hora.desc()).all()
-    return ocorrencias
+    # Retorna todas as ocorrências ordenadas da mais recente para a mais antiga
+    return db.query(models.Ocorrencia).order_by(models.Ocorrencia.id.desc()).all()
 
-# ... (Mantenha todo o código anterior intacto)
 
-# Schema de Validação para a Atualização
-class OcorrenciaUpdate(BaseModel):
-    status: str
-
-# Nova Rota PATCH: Atualiza o status de uma ocorrência específica
 @app.patch("/api/v1/ocorrencias/{ocorrencia_id}")
 def atualizar_status(ocorrencia_id: int, dados: OcorrenciaUpdate, db: Session = Depends(get_db)):
-    # 1. Busca a ocorrência no banco pelo ID
     ocorrencia = db.query(models.Ocorrencia).filter(models.Ocorrencia.id == ocorrencia_id).first()
     
-    # 2. Se não encontrar, retorna erro
     if not ocorrencia:
-        return {"erro": "Ocorrência não encontrada"}
+        raise HTTPException(status_code=404, detail="Ocorrência não encontrada")
     
-    # 3. Atualiza o status e salva no banco
     ocorrencia.status = dados.status
     db.commit()
     db.refresh(ocorrencia)
     
-    return {"mensagem": f"Status da ocorrência {ocorrencia_id} atualizado para {dados.status}"}
+    return ocorrencia
